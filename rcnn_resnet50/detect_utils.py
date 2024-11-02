@@ -2,53 +2,82 @@ import torchvision.transforms as transforms
 import cv2
 import numpy as np
 from coco_names import COCO_INSTANCE_CATEGORY_NAMES as coco_names
+from skeleton_edges import SKELETON_EDGES
+from age_gender import MODEL_MEAN_VALUES, ageList, genderList, initialize_age_gender_models, detect_age_gender
 
 COLORS = np.random.uniform(0, 255, size=(len(coco_names), 3))
 transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-SKELETON_EDGES = {
-    'face': [
-        (0, 1),    # Mũi -> Mắt trái
-        (0, 2),    # Mũi -> Mắt phải
-        (1, 3),    # Mắt trái -> Tai trái
-        (2, 4),    # Mắt phải -> Tai phải
-    ],
+# MODEL_MEAN_VALUES=(78.4263377603, 87.7689143744, 114.895847746)
+# ageList=['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+# genderList=['Male','Female']
+
+# def initialize_age_gender_models():
+#     faceProto = "config/opencv_face_detector.pbtxt"
+#     faceModel = "config/opencv_face_detector_uint8.pb"
+#     ageProto = "config/age_deploy.prototxt"
+#     ageModel = "config/age_net.caffemodel"
+#     genderProto = "config/gender_deploy.prototxt"
+#     genderModel = "config/gender_net.caffemodel"
+
+#     faceNet = cv2.dnn.readNet(faceModel, faceProto)
+#     ageNet = cv2.dnn.readNet(ageModel, ageProto)
+#     genderNet = cv2.dnn.readNet(genderModel, genderProto)
     
-    'body': [
-        (0, 17),   # Mũi -> Điểm giữa vai (điểm tự tính)
-        (17, 18),  # Điểm giữa vai -> Điểm giữa hông (điểm tự tính)
-    ],
+#     return faceNet, ageNet, genderNet
+
+# def detect_age_gender(image, box, faceNet, ageNet, genderNet, padding=20):
+#     face = image[
+#         max(0, int(box[1]) - padding):min(int(box[3]) + padding, image.shape[0] - 1),
+#         max(0, int(box[0]) - padding):min(int(box[2]) + padding, image.shape[1] - 1)
+#     ]
     
-    'arms': [
-        (5, 6),    # Nối 2 vai
-        (5, 7),    # Vai trái -> Khuỷu tay trái
-        (7, 9),    # Khuỷu tay trái -> Cổ tay trái
-        (6, 8),    # Vai phải -> Khuỷu tay phải
-        (8, 10),   # Khuỷu tay phải -> Cổ tay phải
-    ],
+#     if face.size == 0:
+#         return None, None
     
-    'legs': [
-        (11, 13),  # Hông trái -> Đầu gối trái
-        (13, 15),  # Đầu gối trái -> Mắt cá chân trái
-        (12, 14),  # Hông phải -> Đầu gối phải
-        (14, 16),  # Đầu gối phải -> Mắt cá chân phải
-    ]
-}
+#     blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+    
+#     # Predict gender
+#     genderNet.setInput(blob)
+#     genderPreds = genderNet.forward()
+#     gender = genderList[genderPreds[0].argmax()]
+    
+#     # Predict age
+#     ageNet.setInput(blob)
+#     agePreds = ageNet.forward()
+#     age = ageList[agePreds[0].argmax()]
+    
+#     return gender, age
 
 def predict(image, model, device, detection_threshold):
-    image = transform(image).to(device)
-    image = image.unsqueeze(0)
-    outputs = model(image)
-    pred_classes = [coco_names[i] for i in outputs[0]['labels'].cpu().numpy()]
-    pred_scores = outputs[0]['scores'].detach().cpu().numpy()
-    pred_bboxes = outputs[0]['boxes'].detach().cpu().numpy()
-    pred_keypoints = outputs[0]['keypoints'].detach().cpu().numpy()  # Lấy keypoints từ model
+    try:
+        image = transform(image).to(device)
+        image = image.unsqueeze(0)
+        outputs = model(image)
+        
+        # Kiểm tra xem có predictions không
+        if len(outputs) == 0 or len(outputs[0]['labels']) == 0:
+            return [], [], [], []
+            
+        pred_classes = [coco_names[i] for i in outputs[0]['labels'].cpu().numpy()]
+        pred_scores = outputs[0]['scores'].detach().cpu().numpy()
+        pred_bboxes = outputs[0]['boxes'].detach().cpu().numpy()
+        pred_keypoints = outputs[0]['keypoints'].detach().cpu().numpy()
 
-    boxes = pred_bboxes[pred_scores >= detection_threshold].astype(np.int32)
-    keypoints = pred_keypoints[pred_scores >= detection_threshold]  # Lọc keypoints theo threshold
-    return boxes, pred_classes, outputs[0]['labels'], keypoints
+        # Lọc các predictions có score cao hơn threshold
+        mask = pred_scores >= detection_threshold
+        boxes = pred_bboxes[mask].astype(np.int32)
+        pred_classes = [pred_classes[i] for i in range(len(mask)) if mask[i]]
+        labels = outputs[0]['labels'][mask].cpu().numpy()
+        keypoints = pred_keypoints[mask]
+        
+        return boxes, pred_classes, labels, keypoints
+        
+    except Exception as e:
+        print(f"Error in prediction: {str(e)}")
+        return [], [], [], []
 
 def calculate_mid_point(p1, p2):
     return [(p1[0] + p2[0])/2, (p1[1] + p2[1])/2, min(p1[2], p2[2])]
@@ -128,28 +157,48 @@ def draw_skeleton(image, keypoints, visibility_threshold=0.5):
                         if should_draw:
                             cv2.line(image, pt1, pt2, color, 1)
 
-def draw_boxes_and_keypoints(boxes, classes, labels, keypoints, image):
+def draw_boxes_and_keypoints(boxes, classes, labels, keypoints, image, faceNet, ageNet, genderNet):
+    # Kiểm tra nếu không có boxes nào được detect
+    if len(boxes) == 0:
+        return image
+        
     for i, box in enumerate(boxes):
-        if classes[i] == 'person':
-            color = COLORS[labels[i]]
-            
-            # Vẽ bounding box chỉ khi box hợp lý
-            box_width = box[2] - box[0]
-            box_height = box[3] - box[1]
-            if box_width > 0 and box_height > 0 and box_width < image.shape[1] and box_height < image.shape[0]:
-                cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 1)
-                cv2.putText(image, classes[i], (int(box[0]), int(box[1]-5)), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, lineType=cv2.LINE_AA)
-            
-            draw_skeleton(image, [keypoints[i]])
-            
-            # Chỉ vẽ keypoints có độ tin cậy cao và nằm trong box
-            for kp in keypoints[i]:
-                x, y, v = kp
-                if (v > 0.5 and 
-                    box[0] <= x <= box[2] and 
-                    box[1] <= y <= box[3]):
-                    cv2.circle(image, (int(x), int(y)), 3, (205,133,63), -1)
+        try:
+            if classes[i] == 'person':
+                color = COLORS[labels[i]]
+                
+                # Vẽ bounding box
+                box_width = box[2] - box[0]
+                box_height = box[3] - box[1]
+                if box_width > 0 and box_height > 0 and box_width < image.shape[1] and box_height < image.shape[0]:
+                    cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 1)
+                    
+                    # Detect and draw age and gender
+                    try:
+                        gender, age = detect_age_gender(image, box, faceNet, ageNet, genderNet)
+                        if gender and age:
+                            label = f'{classes[i]} - {gender}, {age}'
+                        else:
+                            label = classes[i]
+                    except:
+                        label = classes[i]
+                        
+                    cv2.putText(image, label, (int(box[0]), int(box[1]-5)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, lineType=cv2.LINE_AA)
+                
+                # Kiểm tra keypoints trước khi vẽ
+                if i < len(keypoints):
+                    draw_skeleton(image, [keypoints[i]])
+                    
+                    for kp in keypoints[i]:
+                        x, y, v = kp
+                        if (v > 0.5 and 
+                            box[0] <= x <= box[2] and 
+                            box[1] <= y <= box[3]):
+                            cv2.circle(image, (int(x), int(y)), 3, (205,133,63), -1)
+        except Exception as e:
+            print(f"Error processing detection {i}: {str(e)}")
+            continue
 
     return image
 
